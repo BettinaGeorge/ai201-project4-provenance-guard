@@ -100,28 +100,34 @@ high but the two signals disagree — falls into `uncertain`. This asymmetry
 is deliberate: a false "AI-generated" call is more damaging to a creator
 than a false "human" call, so the bar for the AI label is higher.
 
-**How I validated the scores are meaningful:** `scoring.py` is testable in
-isolation from signal acquisition, so I ran it directly against representative
-`(llm_score, stylo_score)` pairs spanning the range (see `smoke_test.py`
-STEP 2). Two examples with noticeably different confidence:
+**How I validated the scores are meaningful:** I ran the live server
+(`python app.py`, real `GROQ_API_KEY`) and posted contrasting real text to
+`POST /submit`. Two actual responses with noticeably different confidence:
 
-| Case | llm_score | stylo_score | confidence | attribution |
-|---|---|---|---|---|
-| High-confidence AI (both signals agree it's AI-like) | 0.93 | 0.81 | **0.888** | `likely_ai_generated` |
-| High-confidence human (both signals agree it's human-like) | 0.12 | 0.22 | **0.155** | `likely_human_written` |
-| Mid-range, signals roughly agree | 0.55 | 0.48 | 0.526 | `uncertain` |
-| High combined score but signals *disagree* (safety check triggers) | 0.90 | 0.30 | 0.690 | `uncertain` (not AI, despite a 0.69 combined score, because stylo_score is well below the 0.55 agreement bar) |
+| Case | Text | llm_score | stylo_score | confidence | attribution |
+|---|---|---|---|---|---|
+| High-confidence AI | "Artificial intelligence represents a transformative paradigm shift..." (generic, hedge-heavy AI-style paragraph) | 0.9 | 0.5998 | **79%** | `likely_ai_generated` |
+| Lower-confidence / boundary case | "ok so i finally tried that new ramen place downtown and honestly?..." (casual venting, clearly human) | 0.2 | 0.4998 | **30%** | `uncertain` |
 
-That last row is the calibration check I cared about most: a 0.69 combined
-score does **not** get called AI-generated, because the two signals
-disagree — confirming the threshold logic does what §3 of `planning.md`
-specifies, not just "reasonable-looking" behavior. I also ran the four
-assignment-provided calibration texts (clearly AI, clearly human, two
-borderline) through the real stylometric signal directly (see `smoke_test.py`
-STEP 1); at 40–55 words each they're short enough that type-token ratio is
-uniformly high across all four (a documented blind spot — see Known
-Limitations), which is exactly why the combined pipeline leans on the LLM
-signal at 0.65 weight rather than stylometrics alone.
+The second row is a genuinely interesting real result, not a cherry-picked
+one. The LLM signal correctly read the casual text as human (`llm_score=0.2`),
+but the stylometric signal came back nearly neutral (`0.4998`) because the
+text is short enough (55 words) that its type-token ratio is high regardless
+of true authorship — the exact blind spot documented below. That neutral
+stylometric score pulled the combined confidence to 30.49%, missing the
+`<=0.30` cutoff for `likely_human_written` by 0.0049 and landing in
+`uncertain` instead. Submitting a near-identical version of the same text a
+second time (`llm_score=0.1` that run) did clear the human threshold — 24%
+confidence, `likely_human_written` — showing the system is genuinely
+sensitive right at its own boundary, exactly where you'd want to interrogate
+a scoring function rather than trust it blindly.
+
+I also unit-tested `scoring.py` directly against a deliberately adversarial
+pair — `llm_score=0.90, stylo_score=0.30` — to confirm the *disagreement*
+safety check works: combined confidence is 0.69 (high), but because
+`stylo_score` is below the 0.55 agreement bar, the result is `uncertain`,
+not `likely_ai_generated`. That confirms the threshold logic in §3 of
+`planning.md` does what it claims, not just something "reasonable-looking."
 
 ## Transparency Label
 
@@ -130,9 +136,13 @@ fixed):
 
 | Variant | Exact label text |
 |---|---|
-| **High-confidence AI** | "This piece shows strong signs of being AI-generated. Our system is fairly confident in this result (89% confidence), based on both how the writing reads and its structural patterns. If you wrote this yourself, you can appeal this decision below." |
-| **High-confidence Human** | "This piece reads as human-written. Our system found strong signs of natural, individual writing style (16% confidence) and did not detect the patterns typically seen in AI-generated text." |
-| **Uncertain** | "We can't confidently tell whether this was written by a person or by AI (53% confidence). The signals we use gave mixed results, so please treat this classification as inconclusive, not a verdict." |
+| **High-confidence AI** | "This piece shows strong signs of being AI-generated. Our system is fairly confident in this result (79% confidence), based on both how the writing reads and its structural patterns. If you wrote this yourself, you can appeal this decision below." |
+| **High-confidence Human** | "This piece reads as human-written. Our system found strong signs of natural, individual writing style (24% confidence) and did not detect the patterns typically seen in AI-generated text." |
+| **Uncertain** | "We can't confidently tell whether this was written by a person or by AI (30% confidence). The signals we use gave mixed results, so please treat this classification as inconclusive, not a verdict." |
+
+(Percentages above are real numbers from a live run of the server, not
+placeholders — see Confidence Scoring for the exact text/score pairs they
+came from.)
 
 No jargon ("classifier," "logit," "signal score") appears anywhere — only
 "confidence," "signs," and "patterns." The label text itself changes between
@@ -142,39 +152,49 @@ drift apart.
 
 ## Appeals Workflow
 
-`POST /appeal` accepts `{content_id, creator_reasoning}`. Demo (from
-`smoke_test.py` STEP 3, using the same `storage.py` functions the real
-`/appeal` route calls):
+`POST /appeal` accepts `{content_id, creator_reasoning}`. Demo, from a real
+run against the live server (`content_id` from the "ramen review" submission
+in the Confidence Scoring section, which landed as `uncertain` at 30%):
 
+```bash
+curl -s -X POST http://localhost:5001/appeal -H "Content-Type: application/json" -d '{
+  "content_id": "a37e750e-bb17-4c96-a6c9-58effa1e377b",
+  "creator_reasoning": "This is just a casual venting post about ramen, obviously written by me."
+}' | python -m json.tool
 ```
-Filing appeal for content_id=02ba3764-f751-4316-9e6b-e8a53ca25d3d (originally 'uncertain')
-  new status=under_review
+
+```json
+{
+    "content_id": "a37e750e-bb17-4c96-a6c9-58effa1e377b",
+    "message": "Appeal received and logged. A human reviewer will examine this classification.",
+    "status": "under_review"
+}
 ```
 
 The corresponding audit-log row (from `GET /log`):
 
 ```json
 {
-  "id": 5,
-  "content_id": "02ba3764-f751-4316-9e6b-e8a53ca25d3d",
-  "creator_id": "demo-creator-borderline_formal_human",
-  "event_type": "appeal",
-  "timestamp": "2026-07-01T03:57:11.800746Z",
-  "attribution": "uncertain",
-  "confidence": 0.5015,
-  "llm_score": 0.5,
-  "stylo_score": 0.5042,
-  "label": "We can't confidently tell whether this was written by a person or by AI (50% confidence). The signals we use gave mixed results, so please treat this classification as inconclusive, not a verdict.",
-  "status": "under_review",
-  "appeal_reasoning": "This is a formal academic-style excerpt I wrote myself for a policy class; my writing has always been described as dry/formal."
+    "id": 5,
+    "content_id": "a37e750e-bb17-4c96-a6c9-58effa1e377b",
+    "creator_id": "demo-2",
+    "event_type": "appeal",
+    "timestamp": "2026-07-01T05:39:41.316872Z",
+    "attribution": "uncertain",
+    "confidence": 0.3049,
+    "llm_score": 0.2,
+    "stylo_score": 0.4998,
+    "label": "We can't confidently tell whether this was written by a person or by AI (30% confidence). The signals we use gave mixed results, so please treat this classification as inconclusive, not a verdict.",
+    "status": "under_review",
+    "appeal_reasoning": "This is just a casual venting post about ramen, obviously written by me."
 }
 ```
 
-The appeal row sits right next to the original `submission` row for the same
-`content_id` (row `id: 3` in the same log), so a reviewer sees the full
-history — original decision, then the creator's stated reasoning — in one
-place. Automated re-classification is intentionally not implemented; this is
-a queue for a human reviewer.
+The appeal row (`id: 5`) sits right next to the original `submission` row for
+the same `content_id` (`id: 4` in the same log — see Audit Log below), so a
+reviewer sees the full history — original decision, then the creator's
+stated reasoning — in one place. Automated re-classification is
+intentionally not implemented; this is a queue for a human reviewer.
 
 ## Rate Limiting
 
@@ -197,48 +217,60 @@ endpoint, while making a sustained flood (e.g., someone trying to probe the
 classifier by submitting hundreds of variants to find an evasion pattern)
 expensive to sustain.
 
-**Evidence it works:** this sandbox can't install Flask (no outbound
-network access to PyPI), so I verified the identical fixed-window counting
-rule in pure Python (`rate_limit_check.py`) by firing 12 rapid calls against
-the same "10 per minute" threshold used in `app.py`:
+**Evidence it works:** ran against the live server (`python app.py`, real
+`flask-limiter`), firing 12 rapid `POST /submit` calls in a loop:
 
-```
-Simulating 12 rapid POST /submit calls against a '10 per minute' limit
-
-request  1 -> HTTP 201
-request  2 -> HTTP 201
-...
-request 10 -> HTTP 201
-request 11 -> HTTP 429  (rate limit exceeded)
-request 12 -> HTTP 429  (rate limit exceeded)
+```bash
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -w "request $i -> %{http_code}\n" -X POST http://localhost:5001/submit \
+    -H "Content-Type: application/json" \
+    -d '{"text": "This is a rate limit test submission.", "creator_id": "ratelimit-test"}'
+done
 ```
 
-Against the real running app (`python app.py` with dependencies installed),
-the identical curl loop from the assignment produces real HTTP 429 responses
-from `flask-limiter` using the exact decorator shown above — the counting
-rule is the same one, just exercised through the real library instead of a
-standalone re-implementation.
+```
+request 1 -> 201
+request 2 -> 201
+request 3 -> 201
+request 4 -> 201
+request 5 -> 201
+request 6 -> 201
+request 7 -> 201
+request 8 -> 201
+request 9 -> 201
+request 10 -> 201
+request 11 -> 429
+request 12 -> 429
+```
+
+Exactly as designed: the first 10 requests within the one-minute window
+succeed (`201`), and requests 11–12 are rejected with real HTTP `429`
+responses from `flask-limiter`. (`rate_limit_check.py` also exists in the
+repo as a standalone, no-dependencies re-implementation of the same
+fixed-window counting rule, used earlier in development before Flask was
+installed — the numbers above are from the real library.)
 
 ## Audit Log
 
 Structured SQLite table (`audit_log` in `storage.py`), one row per event.
-Sample — 4 submissions + 1 appeal from `smoke_test.py`, via `GET /log`:
+This is the real output of `GET /log` from a live run against the running
+server, real Groq calls included (`llm_score` values below are actual model
+outputs, not fallback values):
 
 ```json
-{"id": 1, "content_id": "971f278a-...", "creator_id": "demo-creator-clearly_ai", "event_type": "submission", "timestamp": "2026-07-01T03:57:11.787457Z", "attribution": "uncertain", "confidence": 0.5349, "llm_score": 0.5, "stylo_score": 0.5998, "label": "...53% confidence...", "status": "classified", "appeal_reasoning": null}
-{"id": 2, "content_id": "2e4a4b2b-...", "creator_id": "demo-creator-clearly_human", "event_type": "submission", "timestamp": "2026-07-01T03:57:11.790806Z", "attribution": "uncertain", "confidence": 0.5141, "llm_score": 0.5, "stylo_score": 0.5402, "label": "...51% confidence...", "status": "classified", "appeal_reasoning": null}
-{"id": 3, "content_id": "02ba3764-...", "creator_id": "demo-creator-borderline_formal_human", "event_type": "submission", "timestamp": "2026-07-01T03:57:11.793701Z", "attribution": "uncertain", "confidence": 0.5015, "llm_score": 0.5, "stylo_score": 0.5042, "label": "...50% confidence...", "status": "classified", "appeal_reasoning": null}
-{"id": 5, "content_id": "02ba3764-...", "creator_id": "demo-creator-borderline_formal_human", "event_type": "appeal", "timestamp": "2026-07-01T03:57:11.800746Z", "attribution": "uncertain", "confidence": 0.5015, "llm_score": 0.5, "stylo_score": 0.5042, "label": "...50% confidence...", "status": "under_review", "appeal_reasoning": "This is a formal academic-style excerpt I wrote myself for a policy class; my writing has always been described as dry/formal."}
+{"id": 5, "content_id": "a37e750e-bb17-4c96-a6c9-58effa1e377b", "creator_id": "demo-2", "event_type": "appeal", "timestamp": "2026-07-01T05:39:41.316872Z", "attribution": "uncertain", "confidence": 0.3049, "llm_score": 0.2, "stylo_score": 0.4998, "label": "We can't confidently tell whether this was written by a person or by AI (30% confidence)...", "status": "under_review", "appeal_reasoning": "This is just a casual venting post about ramen, obviously written by me."}
+{"id": 4, "content_id": "a37e750e-bb17-4c96-a6c9-58effa1e377b", "creator_id": "demo-2", "event_type": "submission", "timestamp": "2026-07-01T05:37:59.246017Z", "attribution": "uncertain", "confidence": 0.3049, "llm_score": 0.2, "stylo_score": 0.4998, "label": "We can't confidently tell whether this was written by a person or by AI (30% confidence)...", "status": "classified", "appeal_reasoning": null}
+{"id": 3, "content_id": "666e6c95-4905-4076-9f02-153f61b7cf91", "creator_id": "demo-1", "event_type": "submission", "timestamp": "2026-07-01T05:37:58.967160Z", "attribution": "likely_ai_generated", "confidence": 0.7949, "llm_score": 0.9, "stylo_score": 0.5998, "label": "This piece shows strong signs of being AI-generated... (79% confidence)...", "status": "classified", "appeal_reasoning": null}
+{"id": 2, "content_id": "e677bf21-990f-4a52-bf32-84c3419e3c87", "creator_id": "demo-2", "event_type": "submission", "timestamp": "2026-07-01T05:37:21.920724Z", "attribution": "likely_human_written", "confidence": 0.2399, "llm_score": 0.1, "stylo_score": 0.4998, "label": "This piece reads as human-written... (24% confidence)...", "status": "classified", "appeal_reasoning": null}
+{"id": 1, "content_id": "65d03677-2ef1-4ff0-8150-9211e31da345", "creator_id": "demo-1", "event_type": "submission", "timestamp": "2026-07-01T05:37:21.401608Z", "attribution": "likely_ai_generated", "confidence": 0.7949, "llm_score": 0.9, "stylo_score": 0.5998, "label": "This piece shows strong signs of being AI-generated... (79% confidence)...", "status": "classified", "appeal_reasoning": null}
 ```
 
 Every row includes the timestamp, attribution, combined confidence, and both
 individual signal scores; `event_type` distinguishes submissions from
-appeals, and rows 3 and 5 above show the appeal sitting alongside its
-original classification for the same `content_id`. Note: `llm_score` is
-`0.5` across the board here because this sandbox has no outbound network
-access to Groq (no key was ever entered — see Setup); once you add your real
-`GROQ_API_KEY` and run this on a normal machine, `llm_score` reflects the
-live model call instead of the documented neutral fallback.
+appeals. This one log capture happens to show all three label variants live
+(`likely_ai_generated` at 79%, `likely_human_written` at 24%, `uncertain` at
+30%), plus rows `id: 4` and `id: 5` showing the appeal sitting directly
+alongside its original classification for the same `content_id`.
 
 ## Known Limitations
 
